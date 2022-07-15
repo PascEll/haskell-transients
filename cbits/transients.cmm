@@ -1,0 +1,10 @@
+#include "Cmm.h"
+
+/* checkSmallMutableArray# :: SmallMutableArray# s a -> State# s -> (# State s, Int# #) */
+checkSmallMutableArrayzh(P_ ma) {
+    if ( StgHeader_info(ma) == stg_SMALL_MUT_ARR_PTRS_FROZEN_DIRTY_info || StgHeader_info(ma) == stg_SMALL_MUT_ARR_PTRS_FROZEN_CLEAN_info) {
+      return(0);
+    } else {
+      return(1);
+    }
+}

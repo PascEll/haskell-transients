@@ -1,0 +1,49 @@
+cabal-version:      2.4
+name:               haskell-transients
+version:            0.1.0.0
+
+-- A short (one-line) description of the package.
+-- synopsis:
+
+-- A longer description of the package.
+-- description:
+
+-- A URL where users can report bugs.
+-- bug-reports:
+
+-- The license under which the package is released.
+-- license:
+author:             Pascal Ellinger
+maintainer:         Pascal Ellinger
+
+-- A copyright notice.
+-- copyright:
+-- category:
+-- extra-source-files: CHANGELOG.md
+
+library
+    exposed-modules: WordMap
+
+    -- Modules included in this library but not exported.
+    other-modules: ArrayCheck
+
+    -- LANGUAGE extensions used by modules in this package.
+    -- other-extensions:
+    build-depends:
+        base ^>=4.14.3.0,
+        primitive
+    hs-source-dirs:   src
+    default-language: Haskell2010
+    c-sources: cbits/transients.cmm
+
+test-suite test
+    type: exitcode-stdio-1.0
+    main-is: test.hs
+    hs-source-dirs: tests
+    default-language: Haskell2010
+
+    build-depends:
+        base,
+        haskell-transients,
+        primitive,
+        QuickCheck
