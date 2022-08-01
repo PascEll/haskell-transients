@@ -113,27 +113,24 @@ lookupT key (TWordMap node) = lookupTNode key node
 {-# INLINE lookupT #-}
 
 lookupTNode :: PrimMonad m => Key -> TNode (PrimState m) a -> m (Maybe a)
-lookupTNode _ TNil = return Nothing
-lookupTNode key (TTip prefix value)
-  | key == prefix = return $ Just value
-  | otherwise = return Nothing
-lookupTNode key (TFull prefix offset children)
-  | index <= 0xf = lookupChild key children index
-  | otherwise = return Nothing
+lookupTNode key = go
   where
-    index = childIndex key prefix offset
-lookupTNode key (TPartial prefix offset mask children)
-  | childIdx <= 0xf && testBit mask childIdx = lookupChild key children arrayIdx
-  | otherwise = return Nothing
-  where
-    childIdx = childIndex key prefix offset
-    arrayIdx = arrayIndex mask childIdx
+    go TNil = return Nothing
+    go (TTip prefix value)
+      | key == prefix = return $ Just value
+      | otherwise = return Nothing
+    go (TFull prefix offset children)
+      | index <= 0xf = readSmallArray children index >>= go
+      | otherwise = return Nothing
+      where
+        index = childIndex key prefix offset
+    go (TPartial prefix offset mask children)
+      | childIdx <= 0xf && testBit mask childIdx = readSmallArray children arrayIdx >>= go
+      | otherwise = return Nothing
+      where
+        childIdx = childIndex key prefix offset
+        arrayIdx = arrayIndex mask childIdx
 {-# INLINE lookupTNode #-}
-
-lookupChild key children index = do
-  child <- readSmallArray children index
-  lookupTNode key child
-{-# INLINE lookupChild #-}
 
 lookupLT :: Key -> WordMap a -> Maybe (Key, a)
 lookupLT key (WordMap node) = lookupLTNode key node
@@ -188,7 +185,7 @@ insertT = insertWithHint Warm
 {-# INLINE insertT #-}
 
 insertWithHint :: (Hint h, PrimMonad m) => h -> Key -> a -> TWordMap (PrimState m) a -> m (TWordMap (PrimState m) a)
-insertWithHint hint key value (TWordMap node) = TWordMap <$> insertTNode Cold key value node
+insertWithHint hint key value (TWordMap node) = TWordMap <$> insertTNode hint key value node
 {-# INLINE insertWithHint #-}
 
 insertTNode :: (Hint h, PrimMonad m) => h -> Key -> a -> TNode (PrimState m) a -> m (TNode (PrimState m) a)
@@ -212,16 +209,16 @@ insertTNodeWith hint f key value = go
     go TNil = return $ TTip key value
     go node@(TTip prefix old_value)
       | key == prefix = return $ TTip key (f value old_value)
-      | otherwise = splitNode hint node key value
+      | otherwise = link hint node (TTip key value)
     go node@(TFull prefix offset children)
       | index <= 0xf = do
         newChildren <- updateChildWith hint go children index
         return $ TFull prefix offset newChildren
-      | otherwise = splitNode hint node key value
+      | otherwise = link hint node (TTip key value)
       where
         index = childIndex key prefix offset
     go node@(TPartial prefix offset mask children)
-      | childIdx > 0xf = splitNode hint node key value
+      | childIdx > 0xf = link hint node (TTip key value)
       | testBit mask childIdx = do
         newChildren <- updateChildWith hint go children arrayIdx
         return $ TPartial prefix offset mask newChildren
@@ -260,7 +257,7 @@ extendFromAscListTNode hint xs node = go xs node
       (node, rest) <- insertAllInSubtree hint xs node
       case rest of
         [] -> return node
-        (k, v) : rest' -> splitNode hint node k v >>= go rest'
+        (k, v) : rest' -> link hint node (TTip k v) >>= go rest'
 {-# INLINE extendFromAscListTNode #-}
 
 insertAllInSubtree ::
@@ -307,7 +304,7 @@ insertAllInSubtree hint kvs node = case node of
       (newChild, rest) <- insertAllInSubtree hint kvs child
       (newChild', rest') <- case rest of
         ((k, v) : rest')
-          | childIndex prefix k offset == childIdx -> (\node -> (node, rest')) <$> splitNode hint newChild k v
+          | childIndex prefix k offset == childIdx -> (\node -> (node, rest')) <$> link hint newChild (TTip k v)
         _ -> pure (newChild, rest)
       newChildren <- updateChild hint children arrayIdx newChild'
       return (newChildren, rest')
@@ -321,57 +318,46 @@ deleteT = deleteWithHint Warm
 {-# INLINE deleteT #-}
 
 deleteWithHint :: (Hint h, PrimMonad m) => h -> Key -> TWordMap (PrimState m) a -> m (TWordMap (PrimState m) a)
-deleteWithHint hint key (TWordMap node) = TWordMap <$> deleteTNode Cold key node
+deleteWithHint hint key (TWordMap node) = TWordMap <$> deleteTNode hint key node
 {-# INLINE deleteWithHint #-}
 
 deleteTNode :: (Hint h, PrimMonad m) => h -> Key -> TNode (PrimState m) a -> m (TNode (PrimState m) a)
-deleteTNode _ _ TNil = return TNil
-deleteTNode _ key node@(TTip prefix _)
-  | key == prefix = return TNil
-  | otherwise = return node
-deleteTNode hint key node@(TFull prefix offset children)
-  | index <= 0xf = do
-    newChild <- deleteFromChild hint key children index
-    case newChild of
-      TNil -> do
-        newChildren <- deleteFromChildren hint children index
-        return $ TPartial prefix offset (complement (bit index)) newChildren
-      _ -> do
-        newChildren <- updateChild hint children index newChild
-        return $ TFull prefix offset newChildren
-  | otherwise = return node
+deleteTNode hint key = go
   where
-    index = childIndex key prefix offset
-deleteTNode hint key node@(TPartial prefix offset mask children)
-  | childIdx <= 0xf && testBit mask childIdx = do
-    newChild <- deleteFromChild hint key children arrayIdx
-    case newChild of
-      TNil
-        | sizeofSmallMutableArray children == 2 -> readSmallArray children ((arrayIdx + 1) .&. 1)
-        | otherwise -> do
-          newChildren <- deleteFromChildren hint children arrayIdx
-          return $ TPartial prefix offset (clearBit mask childIdx) newChildren
-      _ -> do
-        newChildren <- updateChild hint children arrayIdx newChild
-        return $ TPartial prefix offset mask newChildren
-  | otherwise = return node
-  where
-    childIdx = childIndex key prefix offset
-    arrayIdx = arrayIndex mask childIdx
+    go TNil = return TNil
+    go node@(TTip prefix _)
+      | key == prefix = return TNil
+      | otherwise = return node
+    go node@(TFull prefix offset children)
+      | index <= 0xf = do
+        newChild <- readSmallArray children index >>= go
+        case newChild of
+          TNil -> do
+            newChildren <- deleteSmallMutableArrayAndApplyHint hint children index
+            return $ TPartial prefix offset (complement (bit index)) newChildren
+          _ -> do
+            newChildren <- updateChild hint children index newChild
+            return $ TFull prefix offset newChildren
+      | otherwise = return node
+      where
+        index = childIndex key prefix offset
+    go node@(TPartial prefix offset mask children)
+      | childIdx <= 0xf && testBit mask childIdx = do
+        newChild <- readSmallArray children arrayIdx >>= go
+        case newChild of
+          TNil
+            | sizeofSmallMutableArray children == 2 -> readSmallArray children ((arrayIdx + 1) .&. 1)
+            | otherwise -> do
+              newChildren <- deleteSmallMutableArrayAndApplyHint hint children arrayIdx
+              return $ TPartial prefix offset (clearBit mask childIdx) newChildren
+          _ -> do
+            newChildren <- updateChild hint children arrayIdx newChild
+            return $ TPartial prefix offset mask newChildren
+      | otherwise = return node
+      where
+        childIdx = childIndex key prefix offset
+        arrayIdx = arrayIndex mask childIdx
 {-# INLINE deleteTNode #-}
-
-deleteFromChild :: (Hint h, PrimMonad m) => h -> Key -> Children (PrimState m) a -> Int -> m (TNode (PrimState m) a)
-deleteFromChild hint key children index = do
-  child <- readSmallArray children index
-  deleteTNode hint key child
-{-# INLINE deleteFromChild #-}
-
-deleteFromChildren :: (Hint h, PrimMonad m) => h -> Children (PrimState m) a -> Int -> m (Children (PrimState m) a)
-deleteFromChildren hint children arrayIdx = do
-  newChildren <- deleteSmallMutableArray children arrayIdx
-  apply hint newChildren
-  return newChildren
-{-# INLINE deleteFromChildren #-}
 
 union :: WordMap a -> WordMap a -> WordMap a
 union map1 map2 = runST $ unionWithHint Cold (transient map1) (transient map2) >>= persistent
@@ -606,12 +592,6 @@ arrayIndex :: Mask -> Int -> Int
 arrayIndex mask childIndex = popCount (mask .&. (bit childIndex - 1))
 {-# INLINE arrayIndex #-}
 
-splitNode :: (Hint h, PrimMonad m) => h -> TNode (PrimState m) a -> Key -> a -> m (TNode (PrimState m) a)
-splitNode hint node1 key value =
-  let node2 = TTip key value
-   in link hint node1 node2
-{-# INLINE splitNode #-}
-
 link :: (Hint h, PrimMonad m) => h -> TNode (PrimState m) a -> TNode (PrimState m) a -> m (TNode (PrimState m) a)
 link hint node1 node2 = do
   let prefix1 = nodePrefix node1
@@ -668,6 +648,18 @@ insertSmallMutableArray old index element = do
   copySmallMutableArray new (index + 1) old index (oldSize - index)
   return new
 {-# INLINE insertSmallMutableArray #-}
+
+deleteSmallMutableArrayAndApplyHint ::
+  (Hint h, PrimMonad m) =>
+  h ->
+  SmallMutableArray (PrimState m) a ->
+  Int ->
+  m (SmallMutableArray (PrimState m) a)
+deleteSmallMutableArrayAndApplyHint hint old index = do
+  new <- deleteSmallMutableArray old index
+  apply hint new
+  return new
+{-# INLINE deleteSmallMutableArrayAndApplyHint #-}
 
 deleteSmallMutableArray ::
   PrimMonad m =>
