@@ -14,6 +14,7 @@ module WordMap
     TWordMap,
     persistent,
     lookupT,
+    lookupLTT,
     insertT,
     extendFromAscListT,
     deleteT,
@@ -133,48 +134,54 @@ lookupTNode key = go
 {-# INLINE lookupTNode #-}
 
 lookupLT :: Key -> WordMap a -> Maybe (Key, a)
-lookupLT key (WordMap node) = lookupLTNode key node
+lookupLT key map = runST $ lookupLTT key (transient map)
 {-# INLINE lookupLT #-}
 
-lookupLTNode :: Key -> Node a -> Maybe (Key, a)
-lookupLTNode key = go
+lookupLTT :: PrimMonad m => Key -> TWordMap (PrimState m) a -> m (Maybe (Key, a))
+lookupLTT key (TWordMap node) = lookupLTTNode key node
+{-# INLINE lookupLTT #-}
+
+lookupLTTNode :: PrimMonad m => Key -> TNode (PrimState m) a -> m (Maybe (Key, a))
+lookupLTTNode key = go
   where
-    go Nil = Nothing
-    go (Tip prefix value)
-      | prefix >= key = Nothing
-      | otherwise = Just (prefix, value)
-    go (Full prefix offset children)
-      | prefix >= key = Nothing
-      | index > 0xf = lookupMaxNode (indexSmallArray children 0xf)
+    go TNil = return Nothing
+    go (TTip prefix value)
+      | prefix >= key = return Nothing
+      | otherwise = return $ Just (prefix, value)
+    go (TFull prefix offset children)
+      | prefix >= key = return Nothing
+      | index > 0xf = readSmallArray children 0xf >>= lookupMaxTNode
       | otherwise = go' children index
       where
         index = childIndex key prefix offset
-    go (Partial prefix offset mask children)
-      | prefix >= key = Nothing
-      | childIdx > 0xf = lookupMaxNode (indexSmallArray children (sizeofSmallArray children - 1))
+    go (TPartial prefix offset mask children)
+      | prefix >= key = return Nothing
+      | childIdx > 0xf = readSmallArray children (sizeofSmallMutableArray children - 1) >>= lookupMaxTNode
       | not (testBit mask childIdx) =
         if arrayIdx > 0
-          then lookupMaxNode (indexSmallArray children (arrayIdx - 1))
-          else Nothing
+          then readSmallArray children (arrayIdx - 1) >>= lookupMaxTNode
+          else return Nothing
       | otherwise = go' children arrayIdx
       where
         childIdx = childIndex key prefix offset
         arrayIdx = arrayIndex mask childIdx
 
-    go' children index = case go (indexSmallArray children index) of
-      Just kv -> Just kv
-      Nothing ->
-        if index > 0
-          then lookupMaxNode (indexSmallArray children (index - 1))
-          else Nothing
-{-# INLINE lookupLTNode #-}
+    go' children index = do
+      result <- readSmallArray children index >>= go
+      case result of
+        Just kv -> return $ Just kv
+        Nothing ->
+          if index > 0
+            then readSmallArray children (index - 1) >>= lookupMaxTNode
+            else return Nothing
+{-# INLINE lookupLTTNode #-}
 
-lookupMaxNode :: Node a -> Maybe (Key, a)
-lookupMaxNode Nil = Nothing
-lookupMaxNode (Tip prefix value) = Just (prefix, value)
-lookupMaxNode (Full prefix offset children) = lookupMaxNode (indexSmallArray children 0xf)
-lookupMaxNode (Partial prefix offset mask children) =
-  lookupMaxNode (indexSmallArray children (sizeofSmallArray children - 1))
+lookupMaxTNode :: PrimMonad m => TNode (PrimState m) a -> m (Maybe (Key, a))
+lookupMaxTNode TNil = return Nothing
+lookupMaxTNode (TTip prefix value) = return $ Just (prefix, value)
+lookupMaxTNode (TFull prefix offset children) = readSmallArray children 0xf >>= lookupMaxTNode
+lookupMaxTNode (TPartial prefix offset mask children) =
+  readSmallArray children (sizeofSmallMutableArray children - 1) >>= lookupMaxTNode
 
 insert :: Key -> a -> WordMap a -> WordMap a
 insert key value map = runST $ insertWithHint Cold key value (transient map) >>= persistent
