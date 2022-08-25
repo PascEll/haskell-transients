@@ -82,19 +82,19 @@ transient = unsafeCoerce
 {-# INLINE transient #-}
 
 persistent :: PrimMonad m => TWordMap (PrimState m) a -> m (WordMap a)
-persistent (TWordMap transientNode) = do
+persistent (TWordMap transientNode) = stToPrim $ do
   freezeArrays transientNode
   return $ WordMap $ unsafeCoerce transientNode
 {-# INLINE persistent #-}
 
-freezeArrays :: PrimMonad m => TNode (PrimState m) a -> m ()
+freezeArrays :: TNode s a -> ST s ()
 freezeArrays (TFull _ _ children) = freezeArraysHelper children
 freezeArrays (TPartial _ _ _ children) = freezeArraysHelper children
 freezeArrays (TTip _ _) = return ()
 freezeArrays TNil = return ()
 {-# INLINE freezeArrays #-}
 
-freezeArraysHelper :: PrimMonad m => SmallMutableArray (PrimState m) (TNode (PrimState m) a) -> m ()
+freezeArraysHelper :: SmallMutableArray s (TNode s a) -> ST s ()
 freezeArraysHelper children = do
   is_mutable <- unsafeCheckSmallMutableArray children
   when is_mutable $ do
