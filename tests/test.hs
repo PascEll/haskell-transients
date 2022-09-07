@@ -36,7 +36,7 @@ propInsert :: [(Word64, Int)] -> [(Word64, Int)] -> Property
 propInsert xs ys =
   let map0 = fromList xs
       map1 = foldl (\map (k, v) -> insert k v map) map0 ys
-   in map0 === fromList xs .&&. map1 === fromList (xs ++ ys)
+   in toList map0 === toList (fromList xs) .&&. toList map1 === toList (fromList (xs ++ ys))
 
 propInsertT :: [(Word64, Int)] -> [(Word64, Int)] -> Property
 propInsertT xs ys = runST $ do
@@ -44,7 +44,7 @@ propInsertT xs ys = runST $ do
   let tMap0 = transient map0
   tMap1 <- foldM (\map (k, v) -> insertT k v map) tMap0 ys
   map1 <- persistent tMap1
-  return $ map0 === fromList xs .&&. map1 === fromList (xs ++ ys)
+  return $ toList map0 === toList (fromList xs) .&&. toList map1 === toList (fromList (xs ++ ys))
 
 propExtendFromAscList :: [(Word64, Int)] -> OrderedList Word64 -> Property
 propExtendFromAscList xs (Ordered ys) =
@@ -52,14 +52,14 @@ propExtendFromAscList xs (Ordered ys) =
       zs = zip (deduplicate ys) (repeat 0)
       extendedMap = extendFromAscList zs map
       expectedMap = foldl (\map (k, v) -> insert k v map) map zs
-   in expectedMap === extendedMap
+   in toList expectedMap === toList extendedMap
 
 propDelete :: [(Word64, Int)] -> [Word64] -> Property
 propDelete xs ys =
   let map0 = fromList xs
       map1 = foldl (flip delete) map0 ys
       difference = [(k, v) | (k, v) <- xs, k `notElem` ys]
-   in map0 === fromList xs .&&. map1 === fromList difference
+   in toList map0 === toList (fromList xs) .&&. toList map1 === toList (fromList difference)
 
 propDeleteT :: [(Word64, Int)] -> [Word64] -> Property
 propDeleteT xs ys = runST $ do
@@ -68,7 +68,7 @@ propDeleteT xs ys = runST $ do
   tMap1 <- foldM (flip deleteT) tMap0 ys
   map1 <- persistent tMap1
   let difference = [(k, v) | (k, v) <- xs, k `notElem` ys]
-  return $ map0 === fromList xs .&&. map1 === fromList difference
+  return $ toList map0 === toList (fromList xs) .&&. toList map1 === toList (fromList difference)
 
 propUnion :: [(Word64, Int)] -> [(Word64, Int)] -> Property
 propUnion xs ys =
@@ -76,10 +76,10 @@ propUnion xs ys =
       map2 = fromList ys
       unionMap = union map1 map2
       expectedMap = foldl (\map (k, v) -> insert k v map) map2 xs
-   in expectedMap === unionMap
+   in toList expectedMap === toList unionMap
 
 propFromAscList :: OrderedList Word64 -> Property
-propFromAscList (Ordered xs) = fromList ys === fromAscList ys
+propFromAscList (Ordered xs) = ys === toList (fromAscList ys)
   where
     ys = zip (deduplicate xs) (repeat 0)
 

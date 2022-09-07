@@ -1,7 +1,8 @@
 {-# LANGUAGE BangPatterns #-}
 
 module WordMap
-  ( WordMap,
+  ( Key,
+    WordMap,
     transient,
     lookup,
     lookupLT,
@@ -46,23 +47,21 @@ type Key = Word64
 
 type Offset = Int
 
-newtype WordMap a = WordMap (Node a) deriving (Eq, Show)
+newtype WordMap a = WordMap (Node a)
 
-newtype TWordMap s a = TWordMap (TNode s a) deriving (Eq)
+newtype TWordMap s a = TWordMap (TNode s a)
 
 data Node a
   = Full {-# UNPACK #-} !Key {-# UNPACK #-} !Offset !(SmallArray (Node a))
   | Partial {-# UNPACK #-} !Key {-# UNPACK #-} !Offset {-# UNPACK #-} !Mask !(SmallArray (Node a))
   | Tip {-# UNPACK #-} !Key a
   | Nil
-  deriving (Eq, Show)
 
 data TNode s a
   = TFull {-# UNPACK #-} !Key {-# UNPACK #-} !Offset !(SmallMutableArray s (TNode s a))
   | TPartial {-# UNPACK #-} !Key {-# UNPACK #-} !Offset {-# UNPACK #-} !Mask !(SmallMutableArray s (TNode s a))
   | TTip {-# UNPACK #-} !Key a
   | TNil
-  deriving (Eq)
 
 type Children s a = SmallMutableArray s (TNode s a)
 
@@ -90,17 +89,19 @@ persistent (TWordMap transientNode) = stToPrim $ do
 {-# INLINE persistent #-}
 
 freezeArrays :: TNode s a -> ST s ()
-freezeArrays (TFull _ _ children) = freezeArraysHelper children
-freezeArrays (TPartial _ _ _ children) = freezeArraysHelper children
+freezeArrays (TFull _ _ children) = freezeArraysHelper children (sizeofSmallMutableArray children)
+freezeArrays (TPartial _ _ mask children) =
+  let length = popCount mask
+   in freezeArraysHelper children length
 freezeArrays (TTip _ _) = return ()
 freezeArrays TNil = return ()
 {-# INLINE freezeArrays #-}
 
-freezeArraysHelper :: SmallMutableArray s (TNode s a) -> ST s ()
-freezeArraysHelper children = do
+freezeArraysHelper :: SmallMutableArray s (TNode s a) -> Int -> ST s ()
+freezeArraysHelper children length = do
   is_mutable <- unsafeCheckSmallMutableArray children
   when is_mutable $ do
-    forM_ [0 .. sizeofSmallMutableArray children - 1] $ \index -> do
+    forM_ [0 .. length - 1] $ \index -> do
       child <- readSmallArray children index
       freezeArrays child
     unsafeFreezeSmallArray children
@@ -158,7 +159,7 @@ lookupLTTNode !key = go
         index = childIndex key prefix offset
     go (TPartial prefix offset mask children)
       | prefix >= key = return Nothing
-      | childIdx > 0xf = readSmallArray children (sizeofSmallMutableArray children - 1) >>= lookupMaxTNode
+      | childIdx > 0xf = readSmallArray children (length - 1) >>= lookupMaxTNode
       | not (testBit mask childIdx) =
         if arrayIdx > 0
           then readSmallArray children (arrayIdx - 1) >>= lookupMaxTNode
@@ -167,6 +168,7 @@ lookupLTTNode !key = go
       where
         childIdx = childIndex key prefix offset
         arrayIdx = arrayIndex mask childIdx
+        length = popCount mask
 
     go' children index = do
       result <- readSmallArray children index >>= go
@@ -185,7 +187,8 @@ lookupMaxTNode = go
     go (TTip prefix value) = return $ Just (prefix, value)
     go (TFull prefix offset children) = readSmallArray children 0xf >>= go
     go (TPartial prefix offset mask children) =
-      readSmallArray children (sizeofSmallMutableArray children - 1) >>= go
+      let length = popCount mask
+       in readSmallArray children (length - 1) >>= go
 
 insert :: Key -> a -> WordMap a -> WordMap a
 insert key value map = runST $ insertWithHint Cold key value (transient map) >>= persistent
@@ -235,11 +238,12 @@ insertTNodeWith hint f !key value = go
         return $ TPartial prefix offset mask newChildren
       | otherwise = do
         let child = TTip key value
-        !newChildren <- insertSmallMutableArrayAndApplyHint hint children arrayIdx child
+        !newChildren <- insertSmallMutableArrayAndApplyHint hint children length arrayIdx child
         return $! makeTNode prefix offset (setBit mask childIdx) newChildren
       where
         childIdx = childIndex key prefix offset
         arrayIdx = arrayIndex mask childIdx
+        length = popCount mask
 {-# INLINE insertTNodeWith #-}
 
 extendFromAscList :: [(Key, a)] -> WordMap a -> WordMap a
@@ -311,11 +315,12 @@ insertAllInSubtree hint kvs node = case node of
         insertIntoPartial prefix offset mask newChildren rest
       | otherwise = do
         let child = TTip k v
-        !newChildren <- insertSmallMutableArray children arrayIdx child
+        !newChildren <- insertSmallMutableArray children length arrayIdx child
         insertAllInSubtree hint (tail kvs) $! makeTNode prefix offset (setBit mask childIdx) newChildren
       where
         childIdx = childIndex prefix k offset
         arrayIdx = arrayIndex mask childIdx
+        length = popCount mask
 
     insertIntoChild prefix offset children childIdx arrayIdx kvs = do
       child <- readSmallArray children arrayIdx
@@ -423,11 +428,12 @@ unionTNode hint node1 node2
         newChildren <- updateChildWith hint (\child -> unionTNode hint child node2) children1 arrayIdx
         return $! makeTNode prefix1 offset1 mask1 newChildren
       | otherwise = do
-        newChildren <- insertSmallMutableArrayAndApplyHint hint children1 arrayIdx node2
+        newChildren <- insertSmallMutableArrayAndApplyHint hint children1 length arrayIdx node2
         return $! makeTNode prefix1 offset1 (setBit mask1 childIdx) newChildren
       where
         childIdx = childIndex prefix2 prefix1 offset1
         arrayIdx = arrayIndex mask1 childIdx
+        length = popCount mask1
 
     union2
       | childIdx > 0xf = link hint node1 node2
@@ -435,11 +441,12 @@ unionTNode hint node1 node2
         newChildren <- updateChildWith hint (\child -> unionTNode hint node1 child) children2 arrayIdx
         return $! makeTNode prefix2 offset2 mask2 newChildren
       | otherwise = do
-        newChildren <- insertSmallMutableArrayAndApplyHint hint children2 arrayIdx node1
+        newChildren <- insertSmallMutableArrayAndApplyHint hint children2 length arrayIdx node1
         return $! makeTNode prefix2 offset2 (setBit mask2 childIdx) newChildren
       where
         childIdx = childIndex prefix1 prefix2 offset2
         arrayIdx = arrayIndex mask2 childIdx
+        length = popCount mask2
 
     unionChildren = do
       isMutable1 <- unsafeCheckSmallMutableArray children1
@@ -514,8 +521,8 @@ unionTNode hint node1 node2
       newChild <- unionTNode hint child1 child2
       writeSmallArray newChildren arrayIdxNew newChild
 
-    childrenCount1 = sizeofSmallMutableArray children1
-    childrenCount2 = sizeofSmallMutableArray children2
+    childrenCount1 = popCount mask1
+    childrenCount2 = popCount mask2
 
 empty :: WordMap a
 empty = WordMap emptyNode
@@ -562,8 +569,14 @@ toListNode :: Node a -> [(Key, a)]
 toListNode Nil = []
 toListNode (Tip prefix value) = [(prefix, value)]
 toListNode (Full prefix offset children) = concatMap toListNode children
-toListNode (Partial prefix offset mask children) = concatMap toListNode children
-{-# INLINE toListNode #-}
+toListNode (Partial prefix offset mask children) = go 0
+  where
+    length = popCount mask
+    go i
+      | i == length = []
+      | otherwise =
+        let child = indexSmallArray children i
+         in toListNode child ++ go (i + 1)
 
 updateChildWith ::
   (Hint h) =>
@@ -645,10 +658,11 @@ insertSmallMutableArrayAndApplyHint ::
   h ->
   SmallMutableArray s a ->
   Int ->
+  Int ->
   a ->
   ST s (SmallMutableArray s a)
-insertSmallMutableArrayAndApplyHint hint old index element = do
-  new <- insertSmallMutableArray old index element
+insertSmallMutableArrayAndApplyHint hint array length index element = do
+  new <- insertSmallMutableArray array length index element
   apply hint new
   return $! new
 {-# INLINE insertSmallMutableArrayAndApplyHint #-}
@@ -656,14 +670,35 @@ insertSmallMutableArrayAndApplyHint hint old index element = do
 insertSmallMutableArray ::
   SmallMutableArray s a ->
   Int ->
+  Int ->
   a ->
   ST s (SmallMutableArray s a)
-insertSmallMutableArray old index element = do
-  let oldSize = sizeofSmallMutableArray old
-  new <- newSmallArray (oldSize + 1) element
-  copySmallMutableArray new 0 old 0 index
-  copySmallMutableArray new (index + 1) old index (oldSize - index)
-  return $! new
+insertSmallMutableArray array length index element = do
+  isMutable <- unsafeCheckSmallMutableArray array
+  if (length < capacity) && isMutable
+    then insertInPlace
+    else copyAndInsert
+  where
+    capacity = sizeofSmallMutableArray array
+
+    insertInPlace = do
+      moveElements
+      writeSmallArray array index element
+      return array
+
+    copyAndInsert = do
+      let newCapacity = min 16 ((capacity * 3 + 1) `div` 2)
+      new <- newSmallArray newCapacity undefined
+      copySmallMutableArray new 0 array 0 index
+      copySmallMutableArray new (index + 1) array index (length - index)
+      writeSmallArray new index element
+      return $! new
+
+    moveElements = when (length > 0 && index < length) $ go (length - 1)
+      where
+        go i
+          | i == index = readSmallArray array i >>= writeSmallArray array (i + 1)
+          | otherwise = readSmallArray array i >>= writeSmallArray array (i + 1) >> go (i - 1)
 {-# INLINE insertSmallMutableArray #-}
 
 deleteSmallMutableArrayAndApplyHint ::
@@ -682,10 +717,23 @@ deleteSmallMutableArray ::
   SmallMutableArray s a ->
   Int ->
   ST s (SmallMutableArray s a)
-deleteSmallMutableArray old index = do
-  let oldSize = sizeofSmallMutableArray old
-  new <- newSmallArray (oldSize - 1) undefined
-  copySmallMutableArray new 0 old 0 index
-  copySmallMutableArray new index old (index + 1) (oldSize - index - 1)
-  return $! new
+deleteSmallMutableArray array index = do
+  isMutable <- unsafeCheckSmallMutableArray array
+  if isMutable
+    then deleteInPlace >> return array
+    else copyAndDelete
+  where
+    capacity = sizeofSmallMutableArray array
+
+    deleteInPlace = go index
+      where
+        go i
+          | i == (capacity - 1) = writeSmallArray array i undefined
+          | otherwise = readSmallArray array (i + 1) >>= writeSmallArray array i >> go (i + 1)
+
+    copyAndDelete = do
+      new <- newSmallArray capacity undefined
+      copySmallMutableArray new 0 array 0 index
+      copySmallMutableArray new index array (index + 1) (capacity - index - 1)
+      return $! new
 {-# INLINE deleteSmallMutableArray #-}
