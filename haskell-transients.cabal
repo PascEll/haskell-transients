@@ -22,7 +22,7 @@ maintainer:         Pascal Ellinger
 -- extra-source-files: CHANGELOG.md
 
 library
-    exposed-modules: WordMap
+    exposed-modules: WordMap, LinearWordMap, LinearUtils
 
     -- Modules included in this library but not exported.
     other-modules: ArrayCheck
@@ -47,3 +47,4 @@ test-suite test
         haskell-transients,
         primitive,
         QuickCheck
+
