@@ -490,6 +490,7 @@ unionTNode hint node1 node2
 
     unionIntoNew newChildren = do
       go 15 (childrenCount1 - 1) (childrenCount2 - 1) (newChildrenCount - 1)
+      apply hint newChildren
       return $! makeTNode prefix1 offset1 newMask newChildren
       where
         go childIdx arrayIdx1 arrayIdx2 0
