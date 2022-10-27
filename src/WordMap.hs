@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE MagicHash #-}
 
 module WordMap
   ( Key,
@@ -40,6 +41,17 @@ import Data.Word
 import qualified GHC.Exts
 import Unsafe.Coerce
 import Prelude hiding (lookup)
+import GHC.Exts (sameSmallMutableArray#, reallyUnsafePtrEquality#, isTrue#)
+
+samePtr :: a -> a -> Bool
+samePtr !a !b =
+  isTrue# (reallyUnsafePtrEquality# a b)
+{-# INLINE samePtr #-}
+
+sameSmallMutableArray :: SmallMutableArray s a -> SmallMutableArray s a -> Bool
+sameSmallMutableArray (SmallMutableArray a) (SmallMutableArray b) =
+  isTrue# (sameSmallMutableArray# a b)
+{-# INLINE sameSmallMutableArray #-}
 
 type Mask = Word16
 
@@ -218,24 +230,28 @@ insertTNodeWith ::
   a ->
   TNode s a ->
   ST s (TNode s a)
-insertTNodeWith hint f !key value = go
+insertTNodeWith hint f = go
   where
-    go TNil = return $ TTip key value
-    go node@(TTip prefix old_value)
+    go !key value TNil = return $ TTip key value
+    go key value node@(TTip prefix old_value)
       | key == prefix = return $ TTip key (f value old_value)
       | otherwise = link hint node (TTip key value)
-    go node@(TFull prefix offset children)
+    go key value node@(TFull prefix offset children)
       | index <= 0xf = do
-        !newChildren <- updateChildWith hint go children index
-        return $ TFull prefix offset newChildren
+        !newChildren <- updateChildWith hint (go key value) children index
+        if sameSmallMutableArray children newChildren
+          then return node
+          else return $ TFull prefix offset newChildren
       | otherwise = link hint node (TTip key value)
       where
         index = childIndex key prefix offset
-    go node@(TPartial prefix offset mask children)
+    go key value node@(TPartial prefix offset mask children)
       | childIdx > 0xf = link hint node (TTip key value)
       | testBit mask childIdx = do
-        !newChildren <- updateChildWith hint go children arrayIdx
-        return $ TPartial prefix offset mask newChildren
+        !newChildren <- updateChildWith hint (go key value) children arrayIdx
+        if sameSmallMutableArray children newChildren
+          then return node
+          else return $ TPartial prefix offset mask newChildren
       | otherwise = do
         let child = TTip key value
         !newChildren <- insertSmallMutableArrayAndApplyHint hint children length arrayIdx child
@@ -360,7 +376,9 @@ deleteTNode hint key = go
             return $! TPartial prefix offset (complement (bit index)) newChildren
           _ -> do
             newChildren <- updateChild hint children index newChild
-            return $! TFull prefix offset newChildren
+            if sameSmallMutableArray children newChildren
+              then return node
+              else return $ TFull prefix offset newChildren
       | otherwise = return node
       where
         index = childIndex key prefix offset
@@ -375,7 +393,9 @@ deleteTNode hint key = go
               return $ TPartial prefix offset (clearBit mask childIdx) newChildren
           _ -> do
             newChildren <- updateChild hint children arrayIdx newChild
-            return $ TPartial prefix offset mask newChildren
+            if sameSmallMutableArray children newChildren
+              then return node
+              else return $ TPartial prefix offset mask newChildren
       | otherwise = return node
       where
         childIdx = childIndex key prefix offset
@@ -589,7 +609,9 @@ updateChildWith ::
 updateChildWith hint f children index = do
   child <- readSmallArray children index
   newChild <- f child
-  updateChild hint children index newChild
+  if samePtr child newChild
+    then apply hint children >> return children
+    else updateChild hint children index newChild
 {-# INLINE updateChildWith #-}
 
 updateChild ::
