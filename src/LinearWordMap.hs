@@ -36,6 +36,12 @@ insertL key value = toLinear go
     go (LWordMap map) = LWordMap $ unsafePerformIO $ stToIO $ insertT key value map
 {-# INLINE insertL #-}
 
+deleteL :: Key -> LWordMap a %1 -> LWordMap a
+deleteL key = toLinear go
+  where
+    go (LWordMap map) = LWordMap $ unsafePerformIO $ stToIO $ deleteT key map
+{-# INLINE deleteL #-}
+
 lookupL :: Key -> LWordMap a %1 -> (Ur (Maybe a), LWordMap a)
 lookupL key = toLinear go
   where
@@ -43,3 +49,9 @@ lookupL key = toLinear go
       let mbValue = unsafePerformIO $ stToIO $ lookupT key map
        in (Ur mbValue, LWordMap map)
 {-# INLINE lookupL #-}
+
+fromListL :: [(Key, a)] -> (LWordMap a %1 -> Ur b) %1 -> Ur b
+fromListL xs f = f (LWordMap map)
+  where
+    map = unsafePerformIO $ stToIO $ fromListT xs
+{-# INLINE fromListL #-}
