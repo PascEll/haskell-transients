@@ -42,6 +42,7 @@ import qualified GHC.Exts
 import Unsafe.Coerce
 import Prelude hiding (lookup)
 import GHC.Exts (sameSmallMutableArray#, reallyUnsafePtrEquality#, isTrue#)
+import Control.DeepSeq
 
 samePtr :: a -> a -> Bool
 samePtr !a !b =
@@ -760,3 +761,19 @@ deleteSmallMutableArray array index = do
       copySmallMutableArray new index array (index + 1) (capacity - index - 1)
       return $! new
 {-# INLINE deleteSmallMutableArray #-}
+
+instance NFData a => NFData (WordMap a) where
+  rnf (WordMap node) = rnf node
+
+instance NFData a => NFData (Node a) where
+  rnf Nil = ()
+  rnf (Tip _ v) = rnf v
+  rnf (Full _ _ children) = rnfArray children 16
+  rnf (Partial _ _ mask children) = rnfArray children (popCount mask)
+
+rnfArray :: NFData a => SmallArray a -> Int -> ()
+rnfArray array 0 = ()
+rnfArray array length = go array (length - 1)
+  where
+    go array 0 = rnf (indexSmallArray array 0)
+    go array i = rnf (indexSmallArray array i) `seq` go array (i - 1)
