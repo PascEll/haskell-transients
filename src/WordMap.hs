@@ -496,42 +496,16 @@ unionTNode hint node1 node2
     unionChildren = do
       isMutable1 <- unsafeCheckSmallMutableArray children1
       if isMutable1 && maskIsSubset mask2 mask1
-        then unionInto1
+        then unionIntoNew children1
         else do
           isMutable2 <- unsafeCheckSmallMutableArray children2
           if isMutable2 && maskIsSubset mask1 mask2
-            then unionInto2
+            then unionIntoNew children2
             else newSmallArray newChildrenCount undefined >>= unionIntoNew
 
     maskIsSubset mask1 mask2 = (mask2 .|. complement mask1) == complement zeroBits
     newMask = mask1 .|. mask2
     newChildrenCount = popCount newMask
-
-    unionInto1 = do
-      go 15 (childrenCount1 - 1) (childrenCount2 - 1)
-      return $! makeTNode prefix1 offset1 mask1 children1
-      where
-        go childIdx arrayIdx1 0
-          | testBit mask2 childIdx = unionChildrenElements children1 arrayIdx1 children2 0 children1 arrayIdx1
-          | otherwise = return ()
-        go childIdx arrayIdx1 arrayIdx2
-          | testBit mask2 childIdx = do
-            unionChildrenElements children1 arrayIdx1 children2 arrayIdx2 children1 arrayIdx1
-            go (childIdx - 1) (arrayIdx1 - 1) (arrayIdx2 - 1)
-          | otherwise = go (childIdx - 1) (arrayIdx1 - 1) arrayIdx2
-
-    unionInto2 = do
-      go 15 (childrenCount1 - 1) (childrenCount2 - 1)
-      return $! makeTNode prefix2 offset2 mask2 children2
-      where
-        go childIdx 0 arrayIdx2
-          | testBit mask1 childIdx = unionChildrenElements children1 0 children2 arrayIdx2 children2 arrayIdx2
-          | otherwise = return ()
-        go childIdx arrayIdx1 arrayIdx2
-          | testBit mask1 childIdx = do
-            unionChildrenElements children1 arrayIdx1 children2 arrayIdx2 children2 arrayIdx2
-            go (childIdx - 1) (arrayIdx1 - 1) (arrayIdx2 - 1)
-          | otherwise = go (childIdx - 1) arrayIdx1 (arrayIdx2 - 1)
 
     unionIntoNew newChildren = do
       go 15 (childrenCount1 - 1) (childrenCount2 - 1) (newChildrenCount - 1)
