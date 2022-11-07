@@ -60,8 +60,10 @@ type Key = Word64
 
 type Offset = Int
 
+-- | A persistent dictionary with integer keys.
 newtype WordMap a = WordMap (Node a)
 
+-- | A transient dictionary with integer keys.
 newtype TWordMap s a = TWordMap (TNode s a)
 
 data Node a
@@ -91,10 +93,12 @@ instance Hint Cold where
 instance Hint Warm where
   apply _ array = return ()
 
+-- | Convert a persistent 'WordMap' into a transient 'TWordMap'.
 transient :: WordMap a -> TWordMap s a
 transient = unsafeCoerce
 {-# INLINE transient #-}
 
+-- | Convert a transient 'TWordMap' into a persistent 'WordMap'.
 persistent :: TWordMap s a -> ST s (WordMap a)
 persistent (TWordMap transientNode) = stToPrim $ do
   freezeArrays transientNode
@@ -121,10 +125,12 @@ freezeArraysHelper children length = do
     return ()
 {-# INLINE freezeArraysHelper #-}
 
+-- | Lookup the value corresponding to the key in the map.
 lookup :: Key -> WordMap a -> Maybe a
 lookup key map = runST $ lookupT key (transient map)
 {-# INLINE lookup #-}
 
+-- | Lookup the value corresponding to the key in the map.
 lookupT :: Key -> TWordMap s a -> ST s (Maybe a)
 lookupT key (TWordMap node) = lookupTNode key node
 {-# INLINE lookupT #-}
@@ -149,10 +155,12 @@ lookupTNode !key = go
         arrayIdx = arrayIndex mask childIdx
 {-# INLINE lookupTNode #-}
 
+-- | Find the key/value pair corresponding to the largest key that is smaller than the given key.
 lookupLT :: Key -> WordMap a -> Maybe (Key, a)
 lookupLT key map = runST $ lookupLTT key (transient map)
 {-# INLINE lookupLT #-}
 
+-- | Find the key/value pair corresponding to the largest key that is smaller than the given key.
 lookupLTT :: Key -> TWordMap s a -> ST s (Maybe (Key, a))
 lookupLTT key (TWordMap node) = lookupLTTNode key node
 {-# INLINE lookupLTT #-}
@@ -203,10 +211,13 @@ lookupMaxTNode = go
       let length = popCount mask
        in readSmallArray children (length - 1) >>= go
 
+-- | Insert the key/value pair into the map.
 insert :: Key -> a -> WordMap a -> WordMap a
 insert key value map = runST $ insertWithHint Cold key value (transient map) >>= persistent
 {-# INLINE insert #-}
 
+-- | Insert the key/value pair into the map.
+-- The given 'TWordMap' may no longer be used after it is passed to this function.
 insertT :: Key -> a -> TWordMap s a -> ST s (TWordMap s a)
 insertT = insertWithHint Warm
 {-# INLINE insertT #-}
@@ -263,10 +274,15 @@ insertTNodeWith hint f = go
         length = popCount mask
 {-# INLINE insertTNodeWith #-}
 
+-- | Insert the key/value pairs into the map.
+-- The keys must be in ascending order and there must be no duplicate keys.
 extendFromAscList :: [(Key, a)] -> WordMap a -> WordMap a
 extendFromAscList xs map = runST $ extendFromAscListWithHint Cold xs (transient map) >>= persistent
 {-# INLINE extendFromAscList #-}
 
+-- | Insert the key/value pairs into the map.
+-- The keys must be in ascending order and there must be no duplicate keys.
+-- The given 'TWordMap' may no longer be used after it is passed to this function.
 extendFromAscListT :: [(Key, a)] -> TWordMap s a -> ST s (TWordMap s a)
 extendFromAscListT = extendFromAscListWithHint Warm
 {-# INLINE extendFromAscListT #-}
@@ -349,10 +365,13 @@ insertAllInSubtree hint kvs node = case node of
       !newChildren <- updateChild hint children arrayIdx newChild'
       return (newChildren, rest')
 
+-- | Delete the key from the map.
 delete :: Key -> WordMap a -> WordMap a
 delete key map = runST $ deleteWithHint Cold key (transient map) >>= persistent
 {-# INLINE delete #-}
 
+-- | Delete the key from the map.
+-- The given 'TWordMap' may no longer be used after it is passed to this function.
 deleteT :: Key -> TWordMap s a -> ST s (TWordMap s a)
 deleteT = deleteWithHint Warm
 {-# INLINE deleteT #-}
@@ -403,10 +422,15 @@ deleteTNode hint key = go
         arrayIdx = arrayIndex mask childIdx
 {-# INLINE deleteTNode #-}
 
+-- | Returns the union of the two maps.
+-- If a key is in both maps, the result contains the corresponding value from the first map.
 union :: WordMap a -> WordMap a -> WordMap a
 union map1 map2 = runST $ unionWithHint Cold (transient map1) (transient map2) >>= persistent
 {-# INLINE union #-}
 
+-- | Returns the union of the two maps.
+-- If a key is in both maps, the result contains the corresponding value from the first map.
+-- The given 'TWordMaps' may no longer be used after they are passed to this function.
 unionT :: TWordMap s a -> TWordMap s a -> ST s (TWordMap s a)
 unionT = unionWithHint Warm
 {-# INLINE unionT #-}
@@ -546,6 +570,7 @@ unionTNode hint node1 node2
     childrenCount1 = popCount mask1
     childrenCount2 = popCount mask2
 
+-- | The empty map.
 empty :: WordMap a
 empty = WordMap emptyNode
 {-# INLINE empty #-}
@@ -554,6 +579,7 @@ emptyNode :: Node a
 emptyNode = Nil
 {-# INLINE emptyNode #-}
 
+-- | The empty map.
 emptyT :: TWordMap s a
 emptyT = TWordMap emptyTNode
 {-# INLINE emptyT #-}
@@ -562,27 +588,35 @@ emptyTNode :: TNode s a
 emptyTNode = TNil
 {-# INLINE emptyTNode #-}
 
+-- | Create a map from a list of key/value pairs.
 fromList :: [(Key, a)] -> WordMap a
 fromList xs = runST $ fromListT xs >>= persistent
 {-# INLINE fromList #-}
 
+-- | Create a map from a list of key/value pairs.
 fromListT :: [(Key, a)] -> ST s (TWordMap s a)
 fromListT xs = do
   foldM (\map (k, v) -> insertT k v map) emptyT xs
 {-# INLINE fromListT #-}
 
+-- | Create a map from a list of key/value pairs.
+-- The keys must be in ascending order and there must be no duplicate keys.
 fromAscList :: [(Key, a)] -> WordMap a
 fromAscList xs = extendFromAscList xs empty
 {-# INLINE fromAscList #-}
 
+-- | Create a map from a list of key/value pairs.
+-- The keys must be in ascending order and there must be no duplicate keys.
 fromAscListT :: [(Key, a)] -> ST s (TWordMap s a)
 fromAscListT xs = extendFromAscListT xs emptyT
 {-# INLINE fromAscListT #-}
 
+-- | Returns a list of the key/value pairs in the map.
 toList :: WordMap a -> [(Key, a)]
 toList (WordMap node) = toListNode node
 {-# INLINE toList #-}
 
+-- | Returns a list of the key/value pairs in the map.
 toListT :: TWordMap s a -> ST s [(Key, a)]
 toListT map = toList <$> persistent map
 {-# INLINE toListT #-}
