@@ -1,6 +1,6 @@
 {-# LANGUAGE LinearTypes #-}
 
-module LinearWordMap
+module Data.LinearWordMap
   ( LWordMap,
     transientL,
     persistentL,
@@ -10,10 +10,10 @@ module LinearWordMap
 where
 
 import Control.Monad.ST
+import Data.WordMap
 import LinearUtils
 import System.IO.Unsafe
 import Unsafe.Coerce
-import WordMap
 
 newtype LWordMap a = LWordMap (TWordMap RealWorld a)
 

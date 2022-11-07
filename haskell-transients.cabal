@@ -22,7 +22,7 @@ maintainer:         Pascal Ellinger
 -- extra-source-files: CHANGELOG.md
 
 library
-    exposed-modules: WordMap, LinearWordMap, LinearUtils
+    exposed-modules: Data.WordMap, Data.LinearWordMap, LinearUtils
 
     -- Modules included in this library but not exported.
     other-modules: ArrayCheck

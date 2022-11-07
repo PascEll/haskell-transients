@@ -5,8 +5,8 @@ import Control.Monad.ST
 import Data.List (sort)
 import Data.Maybe
 import Data.Word
+import Data.WordMap
 import Test.QuickCheck
-import WordMap
 import Prelude hiding (lookup)
 
 propToListFromList :: [(Word64, Int)] -> Property

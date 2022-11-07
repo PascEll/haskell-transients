@@ -1,7 +1,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE MagicHash #-}
 
-module WordMap
+module Data.WordMap
   ( Key,
     WordMap,
     transient,
