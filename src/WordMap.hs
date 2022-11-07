@@ -31,18 +31,16 @@ module WordMap
 where
 
 import ArrayCheck
-import Control.Exception
+import Control.DeepSeq
+import Control.Exception hiding (mask)
 import Control.Monad
-import Control.Monad.Primitive
 import Control.Monad.ST
 import Data.Bits
 import Data.Primitive hiding (fromList)
 import Data.Word
-import qualified GHC.Exts
+import GHC.Exts (isTrue#, reallyUnsafePtrEquality#, sameSmallMutableArray#)
 import Unsafe.Coerce
 import Prelude hiding (lookup)
-import GHC.Exts (sameSmallMutableArray#, reallyUnsafePtrEquality#, isTrue#)
-import Control.DeepSeq
 
 samePtr :: a -> a -> Bool
 samePtr !a !b =
@@ -60,6 +58,8 @@ type Key = Word64
 
 type Offset = Int
 
+type Children s a = SmallMutableArray s (TNode s a)
+
 -- | A persistent dictionary with integer keys.
 newtype WordMap a = WordMap (Node a)
 
@@ -73,12 +73,10 @@ data Node a
   | Nil
 
 data TNode s a
-  = TFull {-# UNPACK #-} !Key {-# UNPACK #-} !Offset !(SmallMutableArray s (TNode s a))
-  | TPartial {-# UNPACK #-} !Key {-# UNPACK #-} !Offset {-# UNPACK #-} !Mask !(SmallMutableArray s (TNode s a))
+  = TFull {-# UNPACK #-} !Key {-# UNPACK #-} !Offset !(Children s a)
+  | TPartial {-# UNPACK #-} !Key {-# UNPACK #-} !Offset {-# UNPACK #-} !Mask !(Children s a)
   | TTip {-# UNPACK #-} !Key a
   | TNil
-
-type Children s a = SmallMutableArray s (TNode s a)
 
 class Hint h where
   apply :: h -> SmallMutableArray s a -> ST s ()
@@ -91,7 +89,7 @@ instance Hint Cold where
   apply _ array = void (unsafeFreezeSmallArray array)
 
 instance Hint Warm where
-  apply _ array = return ()
+  apply _ _ = return ()
 
 -- | Convert a persistent 'WordMap' into a transient 'TWordMap'.
 transient :: WordMap a -> TWordMap s a
@@ -100,30 +98,23 @@ transient = unsafeCoerce
 
 -- | Convert a transient 'TWordMap' into a persistent 'WordMap'.
 persistent :: TWordMap s a -> ST s (WordMap a)
-persistent (TWordMap transientNode) = stToPrim $ do
-  freezeArrays transientNode
-  return $! WordMap $ unsafeCoerce transientNode
+persistent (TWordMap transientNode) =
+  go transientNode >> (return $! WordMap $ unsafeCoerce transientNode)
+  where
+    go TNil = return ()
+    go (TTip _ _) = return ()
+    go node = do
+      let (children, length) = case node of
+            TFull _ _ children' -> (children', 16)
+            TPartial _ _ mask children' -> (children', popCount mask)
+      is_mutable <- unsafeCheckSmallMutableArray children
+      when is_mutable $ do
+        forM_ [0 .. length - 1] $ \i -> do
+          child <- readSmallArray children i
+          go child
+        _ <- unsafeFreezeSmallArray children
+        return ()
 {-# INLINE persistent #-}
-
-freezeArrays :: TNode s a -> ST s ()
-freezeArrays (TFull _ _ children) = freezeArraysHelper children (sizeofSmallMutableArray children)
-freezeArrays (TPartial _ _ mask children) =
-  let length = popCount mask
-   in freezeArraysHelper children length
-freezeArrays (TTip _ _) = return ()
-freezeArrays TNil = return ()
-{-# INLINE freezeArrays #-}
-
-freezeArraysHelper :: SmallMutableArray s (TNode s a) -> Int -> ST s ()
-freezeArraysHelper children length = do
-  is_mutable <- unsafeCheckSmallMutableArray children
-  when is_mutable $ do
-    forM_ [0 .. length - 1] $ \index -> do
-      child <- readSmallArray children index
-      freezeArrays child
-    unsafeFreezeSmallArray children
-    return ()
-{-# INLINE freezeArraysHelper #-}
 
 -- | Lookup the value corresponding to the key in the map.
 lookup :: Key -> WordMap a -> Maybe a
@@ -182,9 +173,9 @@ lookupLTTNode !key = go
       | prefix >= key = return Nothing
       | childIdx > 0xf = readSmallArray children (length - 1) >>= lookupMaxTNode
       | not (testBit mask childIdx) =
-        if arrayIdx > 0
-          then readSmallArray children (arrayIdx - 1) >>= lookupMaxTNode
-          else return Nothing
+          if arrayIdx > 0
+            then readSmallArray children (arrayIdx - 1) >>= lookupMaxTNode
+            else return Nothing
       | otherwise = go' children arrayIdx
       where
         childIdx = childIndex key prefix offset
@@ -206,8 +197,8 @@ lookupMaxTNode = go
   where
     go TNil = return Nothing
     go (TTip prefix value) = return $ Just (prefix, value)
-    go (TFull prefix offset children) = readSmallArray children 0xf >>= go
-    go (TPartial prefix offset mask children) =
+    go (TFull _prefix _offset children) = readSmallArray children 0xf >>= go
+    go (TPartial _prefix _offset mask children) =
       let length = popCount mask
        in readSmallArray children (length - 1) >>= go
 
@@ -231,17 +222,10 @@ insertTNode hint = insertTNodeWith hint const
 {-# INLINE insertTNode #-}
 
 insertTNodeIfNotPresent :: (Hint h) => h -> Key -> a -> TNode s a -> ST s (TNode s a)
-insertTNodeIfNotPresent hint = insertTNodeWith hint (\new_value old_value -> old_value)
+insertTNodeIfNotPresent hint = insertTNodeWith hint (\_new_value old_value -> old_value)
 {-# INLINE insertTNodeIfNotPresent #-}
 
-insertTNodeWith ::
-  (Hint h) =>
-  h ->
-  (a -> a -> a) ->
-  Key ->
-  a ->
-  TNode s a ->
-  ST s (TNode s a)
+insertTNodeWith :: (Hint h) => h -> (a -> a -> a) -> Key -> a -> TNode s a -> ST s (TNode s a)
 insertTNodeWith hint f = go
   where
     go !key value TNil = return $ TTip key value
@@ -250,24 +234,24 @@ insertTNodeWith hint f = go
       | otherwise = link hint node (TTip key value)
     go key value node@(TFull prefix offset children)
       | index <= 0xf = do
-        !newChildren <- updateChildWith hint (go key value) children index
-        if sameSmallMutableArray children newChildren
-          then return node
-          else return $ TFull prefix offset newChildren
+          !newChildren <- updateChildWith hint (go key value) children index
+          if sameSmallMutableArray children newChildren
+            then return node
+            else return $ TFull prefix offset newChildren
       | otherwise = link hint node (TTip key value)
       where
         index = childIndex key prefix offset
     go key value node@(TPartial prefix offset mask children)
       | childIdx > 0xf = link hint node (TTip key value)
       | testBit mask childIdx = do
-        !newChildren <- updateChildWith hint (go key value) children arrayIdx
-        if sameSmallMutableArray children newChildren
-          then return node
-          else return $ TPartial prefix offset mask newChildren
+          !newChildren <- updateChildWith hint (go key value) children arrayIdx
+          if sameSmallMutableArray children newChildren
+            then return node
+            else return $ TPartial prefix offset mask newChildren
       | otherwise = do
-        let child = TTip key value
-        !newChildren <- insertSmallMutableArrayAndApplyHint hint children length arrayIdx child
-        return $! makeTNode prefix offset (setBit mask childIdx) newChildren
+          let child = TTip key value
+          !newChildren <- insertSmallMutableArrayAndApplyHint hint children length arrayIdx child
+          return $! makeTNode prefix offset (setBit mask childIdx) newChildren
       where
         childIdx = childIndex key prefix offset
         arrayIdx = arrayIndex mask childIdx
@@ -287,17 +271,12 @@ extendFromAscListT :: [(Key, a)] -> TWordMap s a -> ST s (TWordMap s a)
 extendFromAscListT = extendFromAscListWithHint Warm
 {-# INLINE extendFromAscListT #-}
 
-extendFromAscListWithHint ::
-  (Hint h) =>
-  h ->
-  [(Key, a)] ->
-  TWordMap s a ->
-  ST s (TWordMap s a)
+extendFromAscListWithHint :: (Hint h) => h -> [(Key, a)] -> TWordMap s a -> ST s (TWordMap s a)
 extendFromAscListWithHint hint xs (TWordMap node) = TWordMap <$> extendFromAscListTNode hint xs node
 {-# INLINE extendFromAscListWithHint #-}
 
 extendFromAscListTNode :: (Hint h) => h -> [(Key, a)] -> TNode s a -> ST s (TNode s a)
-extendFromAscListTNode hint [] node = return $! node
+extendFromAscListTNode _hint [] node = return $! node
 extendFromAscListTNode hint ((k, v) : xs) TNil = extendFromAscListTNode hint xs (TTip k v)
 extendFromAscListTNode hint xs node = go xs node
   where
@@ -308,32 +287,27 @@ extendFromAscListTNode hint xs node = go xs node
         (k, v) : rest' -> link hint node (TTip k v) >>= go rest'
 {-# INLINE extendFromAscListTNode #-}
 
-insertAllInSubtree ::
-  (Hint h) =>
-  h ->
-  [(Key, a)] ->
-  TNode s a ->
-  ST s (TNode s a, [(Key, a)])
+insertAllInSubtree :: (Hint h) => h -> [(Key, a)] -> TNode s a -> ST s (TNode s a, [(Key, a)])
 insertAllInSubtree hint kvs node = case node of
-  TTip key value
+  TTip key _value
     | ((k, v) : rest) <- kvs, key == k -> return (TTip key v, rest)
     | otherwise -> return (node, kvs)
   TFull prefix offset children -> insertIntoFull prefix offset children kvs
   TPartial prefix offset mask children -> insertIntoPartial prefix offset mask children kvs
-  TNil -> undefined
+  _ -> undefined
   where
     insertIntoFull prefix offset children [] = do
       apply hint children
       let !node = TFull prefix offset children
       return (node, [])
-    insertIntoFull prefix offset children kvs@((k, v) : _)
+    insertIntoFull prefix offset children kvs@((k, _) : _)
       | index > 0xf = do
-        apply hint children
-        let !node = TFull prefix offset children
-        return (node, kvs)
+          apply hint children
+          let !node = TFull prefix offset children
+          return (node, kvs)
       | otherwise = do
-        (newChildren, rest) <- insertIntoChild prefix offset children index index kvs
-        insertIntoFull prefix offset newChildren rest
+          (newChildren, rest) <- insertIntoChild prefix offset children index index kvs
+          insertIntoFull prefix offset newChildren rest
       where
         index = childIndex prefix k offset
 
@@ -344,12 +318,13 @@ insertAllInSubtree hint kvs node = case node of
     insertIntoPartial prefix offset mask children kvs@((k, v) : _)
       | childIdx > 0xf = apply hint children >> return (TPartial prefix offset mask children, kvs)
       | testBit mask childIdx = do
-        (!newChildren, rest) <- insertIntoChild prefix offset children childIdx arrayIdx kvs
-        insertIntoPartial prefix offset mask newChildren rest
+          (!newChildren, rest) <- insertIntoChild prefix offset children childIdx arrayIdx kvs
+          insertIntoPartial prefix offset mask newChildren rest
       | otherwise = do
-        let child = TTip k v
-        !newChildren <- insertSmallMutableArray children length arrayIdx child
-        insertAllInSubtree hint (tail kvs) $! makeTNode prefix offset (setBit mask childIdx) newChildren
+          let child = TTip k v
+          !newChildren <- insertSmallMutableArray children length arrayIdx child
+          insertAllInSubtree hint (tail kvs) $!
+            makeTNode prefix offset (setBit mask childIdx) newChildren
       where
         childIdx = childIndex prefix k offset
         arrayIdx = arrayIndex mask childIdx
@@ -360,7 +335,8 @@ insertAllInSubtree hint kvs node = case node of
       (newChild, rest) <- insertAllInSubtree hint kvs child
       (newChild', rest') <- case rest of
         ((k, v) : rest')
-          | childIndex prefix k offset == childIdx -> (\node -> (node, rest')) <$> link hint newChild (TTip k v)
+          | childIndex prefix k offset == childIdx ->
+              (\node -> (node, rest')) <$> link hint newChild (TTip k v)
         _ -> pure (newChild, rest)
       !newChildren <- updateChild hint children arrayIdx newChild'
       return (newChildren, rest')
@@ -389,33 +365,34 @@ deleteTNode hint key = go
       | otherwise = return node
     go node@(TFull prefix offset children)
       | index <= 0xf = do
-        newChild <- readSmallArray children index >>= go
-        case newChild of
-          TNil -> do
-            newChildren <- deleteSmallMutableArrayAndApplyHint hint children index
-            return $! TPartial prefix offset (complement (bit index)) newChildren
-          _ -> do
-            newChildren <- updateChild hint children index newChild
-            if sameSmallMutableArray children newChildren
-              then return node
-              else return $ TFull prefix offset newChildren
+          newChild <- readSmallArray children index >>= go
+          case newChild of
+            TNil -> do
+              newChildren <- deleteSmallMutableArrayAndApplyHint hint children index
+              return $! TPartial prefix offset (complement (bit index)) newChildren
+            _ -> do
+              newChildren <- updateChild hint children index newChild
+              if sameSmallMutableArray children newChildren
+                then return node
+                else return $ TFull prefix offset newChildren
       | otherwise = return node
       where
         index = childIndex key prefix offset
     go node@(TPartial prefix offset mask children)
       | childIdx <= 0xf && testBit mask childIdx = do
-        newChild <- readSmallArray children arrayIdx >>= go
-        case newChild of
-          TNil
-            | sizeofSmallMutableArray children == 2 -> readSmallArray children ((arrayIdx + 1) .&. 1)
-            | otherwise -> do
-              newChildren <- deleteSmallMutableArrayAndApplyHint hint children arrayIdx
-              return $ TPartial prefix offset (clearBit mask childIdx) newChildren
-          _ -> do
-            newChildren <- updateChild hint children arrayIdx newChild
-            if sameSmallMutableArray children newChildren
-              then return node
-              else return $ TPartial prefix offset mask newChildren
+          newChild <- readSmallArray children arrayIdx >>= go
+          case newChild of
+            TNil
+              | sizeofSmallMutableArray children == 2 ->
+                  readSmallArray children ((arrayIdx + 1) .&. 1)
+              | otherwise -> do
+                  newChildren <- deleteSmallMutableArrayAndApplyHint hint children arrayIdx
+                  return $ TPartial prefix offset (clearBit mask childIdx) newChildren
+            _ -> do
+              newChildren <- updateChild hint children arrayIdx newChild
+              if sameSmallMutableArray children newChildren
+                then return node
+                else return $ TPartial prefix offset mask newChildren
       | otherwise = return node
       where
         childIdx = childIndex key prefix offset
@@ -435,12 +412,7 @@ unionT :: TWordMap s a -> TWordMap s a -> ST s (TWordMap s a)
 unionT = unionWithHint Warm
 {-# INLINE unionT #-}
 
-unionWithHint ::
-  (Hint h) =>
-  h ->
-  TWordMap s a ->
-  TWordMap s a ->
-  ST s (TWordMap s a)
+unionWithHint :: (Hint h) => h -> TWordMap s a -> TWordMap s a -> ST s (TWordMap s a)
 unionWithHint hint (TWordMap node1) (TWordMap node2) = TWordMap <$> unionTNode hint node1 node2
 {-# INLINE unionWithHint #-}
 
@@ -458,23 +430,22 @@ unionTNode hint node1 node2
     (prefix1, offset1, mask1, children1) = case node1 of
       TFull prefix offset children -> (prefix, offset, complement zeroBits, children)
       TPartial prefix offset mask children -> (prefix, offset, mask, children)
-      _ -> undefined
 
     (prefix2, offset2, mask2, children2) = case node2 of
       TFull prefix offset children -> (prefix, offset, complement zeroBits, children)
       TPartial prefix offset mask children -> (prefix, offset, mask, children)
-      _ -> undefined
 
     shorter offset1 offset2 = offset1 > offset2
 
     union1
       | childIdx > 0xf = link hint node1 node2
       | testBit mask1 childIdx = do
-        newChildren <- updateChildWith hint (\child -> unionTNode hint child node2) children1 arrayIdx
-        return $! makeTNode prefix1 offset1 mask1 newChildren
+          newChildren <-
+            updateChildWith hint (\child -> unionTNode hint child node2) children1 arrayIdx
+          return $! makeTNode prefix1 offset1 mask1 newChildren
       | otherwise = do
-        newChildren <- insertSmallMutableArrayAndApplyHint hint children1 length arrayIdx node2
-        return $! makeTNode prefix1 offset1 (setBit mask1 childIdx) newChildren
+          newChildren <- insertSmallMutableArrayAndApplyHint hint children1 length arrayIdx node2
+          return $! makeTNode prefix1 offset1 (setBit mask1 childIdx) newChildren
       where
         childIdx = childIndex prefix2 prefix1 offset1
         arrayIdx = arrayIndex mask1 childIdx
@@ -483,11 +454,12 @@ unionTNode hint node1 node2
     union2
       | childIdx > 0xf = link hint node1 node2
       | testBit mask2 childIdx = do
-        newChildren <- updateChildWith hint (\child -> unionTNode hint node1 child) children2 arrayIdx
-        return $! makeTNode prefix2 offset2 mask2 newChildren
+          newChildren <-
+            updateChildWith hint (\child -> unionTNode hint node1 child) children2 arrayIdx
+          return $! makeTNode prefix2 offset2 mask2 newChildren
       | otherwise = do
-        newChildren <- insertSmallMutableArrayAndApplyHint hint children2 length arrayIdx node1
-        return $! makeTNode prefix2 offset2 (setBit mask2 childIdx) newChildren
+          newChildren <- insertSmallMutableArrayAndApplyHint hint children2 length arrayIdx node1
+          return $! makeTNode prefix2 offset2 (setBit mask2 childIdx) newChildren
       where
         childIdx = childIndex prefix1 prefix2 offset2
         arrayIdx = arrayIndex mask2 childIdx
@@ -513,7 +485,8 @@ unionTNode hint node1 node2
       return $! makeTNode prefix1 offset1 newMask newChildren
       where
         go childIdx arrayIdx1 arrayIdx2 0
-          | present1 && present2 = unionChildrenElements children1 arrayIdx1 children2 arrayIdx2 newChildren 0
+          | present1 && present2 =
+              unionChildrenElements children1 arrayIdx1 children2 arrayIdx2 newChildren 0
           | present1 = copySmallMutableArray newChildren 0 children1 arrayIdx1 1
           | present2 = copySmallMutableArray newChildren 0 children2 arrayIdx2 1
           | otherwise = go (childIdx - 1) arrayIdx1 arrayIdx2 0
@@ -522,14 +495,14 @@ unionTNode hint node1 node2
             !present2 = testBit mask2 childIdx
         go childIdx arrayIdx1 arrayIdx2 arrayIdxNew
           | present1 && present2 = do
-            unionChildrenElements children1 arrayIdx1 children2 arrayIdx2 newChildren arrayIdxNew
-            go (childIdx - 1) (arrayIdx1 - 1) (arrayIdx2 - 1) (arrayIdxNew - 1)
+              unionChildrenElements children1 arrayIdx1 children2 arrayIdx2 newChildren arrayIdxNew
+              go (childIdx - 1) (arrayIdx1 - 1) (arrayIdx2 - 1) (arrayIdxNew - 1)
           | present1 = do
-            copySmallMutableArray newChildren arrayIdxNew children1 arrayIdx1 1
-            go (childIdx - 1) (arrayIdx1 - 1) arrayIdx2 (arrayIdxNew - 1)
+              copySmallMutableArray newChildren arrayIdxNew children1 arrayIdx1 1
+              go (childIdx - 1) (arrayIdx1 - 1) arrayIdx2 (arrayIdxNew - 1)
           | present2 = do
-            copySmallMutableArray newChildren arrayIdxNew children2 arrayIdx2 1
-            go (childIdx - 1) arrayIdx1 (arrayIdx2 - 1) (arrayIdxNew - 1)
+              copySmallMutableArray newChildren arrayIdxNew children2 arrayIdx2 1
+              go (childIdx - 1) arrayIdx1 (arrayIdx2 - 1) (arrayIdxNew - 1)
           | otherwise = go (childIdx - 1) arrayIdx1 arrayIdx2 arrayIdxNew
           where
             !present1 = testBit mask1 childIdx
@@ -598,15 +571,15 @@ toListT map = toList <$> persistent map
 toListNode :: Node a -> [(Key, a)]
 toListNode Nil = []
 toListNode (Tip prefix value) = [(prefix, value)]
-toListNode (Full prefix offset children) = concatMap toListNode children
-toListNode (Partial prefix offset mask children) = go 0
+toListNode (Full _prefix _offset children) = concatMap toListNode children
+toListNode (Partial _prefix _offset mask children) = go 0
   where
     length = popCount mask
     go i
       | i == length = []
       | otherwise =
-        let child = indexSmallArray children i
-         in toListNode child ++ go (i + 1)
+          let child = indexSmallArray children i
+           in toListNode child ++ go (i + 1)
 
 updateChildWith ::
   (Hint h) =>
@@ -623,13 +596,7 @@ updateChildWith hint f children index = do
     else updateChild hint children index newChild
 {-# INLINE updateChildWith #-}
 
-updateChild ::
-  (Hint h) =>
-  h ->
-  Children s a ->
-  Int ->
-  TNode s a ->
-  ST s (Children s a)
+updateChild :: (Hint h) => h -> Children s a -> Int -> TNode s a -> ST s (Children s a)
 updateChild hint children index newChild = do
   isMutable <- unsafeCheckSmallMutableArray children
   newChildren <-
@@ -652,7 +619,7 @@ childIndex key prefix offset = fromIntegral $ unsafeShiftR (xor key prefix) offs
 {-# INLINE childIndex #-}
 
 arrayIndex :: Mask -> Int -> Int
-arrayIndex mask childIndex = popCount (mask .&. (bit childIndex - 1))
+arrayIndex mask childIdx = popCount (mask .&. (bit childIdx - 1))
 {-# INLINE arrayIndex #-}
 
 link :: (Hint h) => h -> TNode s a -> TNode s a -> ST s (TNode s a)
@@ -699,12 +666,7 @@ insertSmallMutableArrayAndApplyHint hint array length index element = do
   return $! new
 {-# INLINE insertSmallMutableArrayAndApplyHint #-}
 
-insertSmallMutableArray ::
-  SmallMutableArray s a ->
-  Int ->
-  Int ->
-  a ->
-  ST s (SmallMutableArray s a)
+insertSmallMutableArray :: SmallMutableArray s a -> Int -> Int -> a -> ST s (SmallMutableArray s a)
 insertSmallMutableArray array length index element = do
   isMutable <- unsafeCheckSmallMutableArray array
   if (length < capacity) && isMutable
@@ -745,10 +707,7 @@ deleteSmallMutableArrayAndApplyHint hint old index = do
   return $! new
 {-# INLINE deleteSmallMutableArrayAndApplyHint #-}
 
-deleteSmallMutableArray ::
-  SmallMutableArray s a ->
-  Int ->
-  ST s (SmallMutableArray s a)
+deleteSmallMutableArray :: SmallMutableArray s a -> Int -> ST s (SmallMutableArray s a)
 deleteSmallMutableArray array index = do
   isMutable <- unsafeCheckSmallMutableArray array
   if isMutable
@@ -780,8 +739,8 @@ instance NFData a => NFData (Node a) where
   rnf (Partial _ _ mask children) = rnfArray children (popCount mask)
 
 rnfArray :: NFData a => SmallArray a -> Int -> ()
-rnfArray array 0 = ()
-rnfArray array length = go array (length - 1)
+rnfArray _array 0 = ()
+rnfArray array length = go (length - 1)
   where
-    go array 0 = rnf (indexSmallArray array 0)
-    go array i = rnf (indexSmallArray array i) `seq` go array (i - 1)
+    go 0 = rnf (indexSmallArray array 0)
+    go i = rnf (indexSmallArray array i) `seq` go (i - 1)
